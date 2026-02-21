@@ -1,0 +1,53 @@
+# Data files
+*.csv
+*.rds
+*.RData
+*.Rda
+
+# Model artifacts
+*.model
+*.pkl
+*.h5
+*.joblib
+ext_source_medians.rds
+
+# Submission files
+submission.csv
+
+# Large intermediate files
+processed_*.csv
+train_processed.*
+test_processed.*
+
+# R/RStudio files
+.Rhistory
+.RData
+.Rproj.user
+*.Rproj
+
+# Python files
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# Environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# HTML output files (optional - can be committed if desired)
+*.html
+*_files/
+
+# Logs
+*.log

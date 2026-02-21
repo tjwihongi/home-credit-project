@@ -1,0 +1,715 @@
+---
+title: "Home Credit Default Risk - Modeling"
+author: "Tama Wihongi"
+date: "2/20/2026"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  message = FALSE, 
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+# Introduction
+
+This notebook explores different modeling approaches for predicting loan default risk using the Home Credit dataset. The goal is to develop a model that beats a simple baseline and produces actionable predictions for the business problem.
+
+**Key objectives:**
+
+- Establish a performance benchmark
+- Compare candidate models using cross-validation and AUC
+- Address class imbalance in the target variable
+- Tune hyperparameters for the best-performing model
+- Incorporate supplementary data features
+- Generate a Kaggle submission
+
+# Load Libraries and Data
+
+We'll use several key R packages for this modeling pipeline:
+
+- **tidyverse**: Data manipulation and visualization
+- **caret**: Model training framework (for logistic regression)
+- **pROC**: ROC curve analysis and AUC calculation
+- **ROSE**: Handling class imbalance with synthetic sampling
+- **xgboost**: Gradient boosting implementation
+- **knitr**: Creating formatted tables in the output
+
+```{r libraries}
+library(tidyverse)
+library(caret)
+library(pROC)
+library(ROSE)
+library(xgboost)
+library(knitr)
+
+# Set seed for reproducibility
+set.seed(42)
+```
+
+## Loading and Processing Data
+
+We start by loading the raw application data and supplementary tables (bureau, previous_application, installments_payments). We then apply our feature engineering pipeline from `feature_engineering.R` to:
+
+1. Clean known data issues (DAYS_EMPLOYED anomaly, missing EXT_SOURCE values)
+2. Create demographic and financial features (age, employment years, ratios)
+3. Aggregate supplementary data to the applicant level
+4. Join all features together
+
+**Important**: We compute medians and thresholds from the training data only and save them. These same values will be used when processing the test set to ensure consistency and avoid data leakage.
+
+```{r load-data, results='hide'}
+# Load the feature engineering script
+source("feature_engineering.R")
+
+# Load raw data
+app_train <- read_csv("application_train.csv", show_col_types = FALSE)
+app_test <- read_csv("application_test.csv", show_col_types = FALSE)
+prev_app <- read_csv("previous_application.csv", show_col_types = FALSE)
+bureau <- read_csv("bureau.csv", show_col_types = FALSE)
+inst_pay <- read_csv("installments_payments.csv", show_col_types = FALSE)
+
+# Apply feature engineering pipeline
+result_train <- feature_engineering_pipeline(app_train, prev_app, bureau, inst_pay)
+train_processed <- result_train$df
+train_medians <- result_train$medians
+
+# Save medians for test set
+saveRDS(train_medians, "ext_source_medians.rds")
+
+# Process test set with same medians
+result_test <- feature_engineering_pipeline(app_test, prev_app, bureau, inst_pay, 
+                                            train_medians = train_medians)
+test_processed <- result_test$df
+```
+
+```{r show-dimensions}
+cat("Training set dimensions:", dim(train_processed), "\n")
+cat("Test set dimensions:", dim(test_processed), "\n")
+```
+
+The feature engineering pipeline has created many features from the raw application data and supplementary tables.
+
+# Exploratory Analysis of Target Variable
+
+Before building models, we need to understand the distribution of our target variable (loan default). This is critical because it will inform our modeling strategy, particularly around handling class imbalance.
+
+```{r target-distribution}
+# Examine target variable distribution
+target_summary <- train_processed |> 
+  count(TARGET) |> 
+  mutate(Percentage = n / sum(n) * 100)
+
+kable(target_summary, caption = "Target Variable Distribution")
+
+# Visualize
+ggplot(target_summary, aes(x = factor(TARGET), y = n, fill = factor(TARGET))) +
+  geom_col() +
+  geom_text(aes(label = paste0(round(Percentage, 1), "%")), vjust = -0.5) +
+  labs(title = "Target Variable Distribution", 
+       x = "Default (1 = Yes, 0 = No)", 
+       y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+**Observation:** The target variable is highly imbalanced with approximately 8% default rate. This severe imbalance means:
+
+- A naive model that always predicts "no default" would achieve ~92% accuracy
+- We must use AUC (Area Under ROC Curve) as our primary metric, not accuracy
+- We'll need to experiment with class imbalance techniques like downsampling or SMOTE
+
+# Prepare Modeling Dataset
+
+For this initial modeling exploration, we'll focus on numeric predictors only to ensure compatibility with all algorithms. We'll also remove rows with missing values for a clean baseline comparison. Later models can explore more sophisticated missing value handling.
+
+**Speed optimization**: To manage computation time during model exploration, we'll work with a 5,000-row sample. The final model will be trained on the full dataset.
+
+```{r prepare-modeling-data, results='hide'}
+# Select numeric predictors only (simplification for reliable modeling)
+numeric_cols <- train_processed |> 
+  select(where(is.numeric), -TARGET, -SK_ID_CURR) |> 
+  names()
+
+# Create final training dataset with complete cases
+train_final <- train_processed |> 
+  select(all_of(numeric_cols), TARGET) |> 
+  drop_na()
+```
+
+```{r show-modeling-data}
+cat("Final training set dimensions:", dim(train_final), "\n")
+cat("Number of predictors:", length(numeric_cols), "\n")
+cat("Rows dropped due to missing values:", nrow(train_processed) - nrow(train_final), "\n")
+```
+
+We're working with many numeric predictors including engineered features from the application data and aggregated features from supplementary tables.
+
+# Benchmark Baseline Model
+
+Every modeling project should establish a baseline to beat. For classification with imbalanced data, we use the **majority class classifier** as our baseline.
+
+## Majority Class Classifier
+
+This naive model simply predicts the most common class (no default) for every observation.
+
+```{r baseline-majority}
+# Predict majority class (0) for all observations
+baseline_pred <- rep(0, nrow(train_final))
+baseline_accuracy <- mean(baseline_pred == train_final$TARGET)
+
+cat("Baseline (Majority Class) Accuracy:", round(baseline_accuracy, 4), "\n")
+cat("Baseline AUC: 0.5 (no discrimination)\n")
+```
+
+**Baseline Result:** The majority class classifier achieves high accuracy (over 90%) but has an AUC of 0.5 (no better than random guessing). This demonstrates why accuracy is a poor metric for imbalanced data - a model with high accuracy provides no discrimination ability. Our goal is to significantly improve upon this AUC baseline.
+
+# Model Comparison with Cross-Validation
+
+Now we'll compare several model types to identify which algorithms work best for this problem. We use **3-fold cross-validation** to estimate out-of-sample performance and **AUC** as our primary evaluation metric.
+
+**Computational efficiency**: We use a 5,000-row sample for initial model comparison. This allows us to quickly test multiple algorithms before committing to expensive hyperparameter tuning on the full dataset.
+
+```{r create-sample, results='hide'}
+# Create sample for faster model comparison
+set.seed(42)
+train_sample <- train_final |> slice_sample(n = 5000)
+
+# Prepare data for XGBoost (numeric matrix format)
+train_sample_matrix <- train_sample |> select(-TARGET) |> as.matrix()
+train_sample_label <- train_sample$TARGET
+```
+
+## Model 1: Logistic Regression (Basic Predictors)
+
+We start with a simple logistic regression using only the most important predictors identified in our EDA:
+
+- Age and employment duration (demographic factors)
+- Financial ratios (credit-to-income, annuity-to-income)
+- External credit scores (EXT_SOURCE_1, EXT_SOURCE_2, EXT_SOURCE_3)
+
+This serves as an interpretable baseline that business stakeholders can easily understand.
+
+```{r model-logistic-basic}
+# Select key predictors based on EDA
+basic_predictors <- c("AGE_YEARS", "EMPLOYMENT_YEARS", "CREDIT_INCOME_RATIO", 
+                      "ANNUITY_INCOME_RATIO", "EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3")
+
+# Prepare data
+X_basic <- train_sample |> select(all_of(basic_predictors))
+y_basic <- factor(train_sample$TARGET, levels = c(0, 1), labels = c("No", "Yes"))
+
+# Train with 3-fold CV
+train_control <- trainControl(
+  method = "cv",
+  number = 3,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+
+model_logistic_basic <- train(
+  x = X_basic,
+  y = y_basic,
+  method = "glm",
+  family = "binomial",
+  trControl = train_control,
+  metric = "ROC"
+)
+
+cat("Logistic Regression (Basic) - CV AUC:", round(model_logistic_basic$results$ROC, 4), "\n")
+```
+
+The basic logistic regression provides a solid starting point with just 7 intuitive predictors.
+
+## Model 2: XGBoost (Native Implementation)
+
+Next, we test XGBoost, a powerful gradient boosting algorithm known for winning Kaggle competitions. We use XGBoost's native cross-validation function rather than caret to avoid compatibility issues.
+
+**Why XGBoost?**
+- Handles missing values automatically
+- Captures non-linear relationships and interactions
+- Built-in regularization to prevent overfitting
+- Fast training with parallel processing
+
+We start with reasonable default hyperparameters before tuning.
+
+```{r model-xgb-basic, results='hide'}
+# Use xgboost's native CV function to avoid caret compatibility issues
+xgb_params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.1,
+  max_depth = 6,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+# Create DMatrix
+dtrain <- xgb.DMatrix(data = train_sample_matrix, label = train_sample_label)
+
+# Cross-validation
+xgb_cv <- xgb.cv(
+  params = xgb_params,
+  data = dtrain,
+  nrounds = 100,
+  nfold = 3,
+  early_stopping_rounds = 10,
+  verbose = 0
+)
+
+cat("XGBoost (Basic) - CV AUC:", round(max(xgb_cv$evaluation_log$test_auc_mean), 4), "\n")
+cat("Best iteration:", xgb_cv$best_iteration, "\n")
+```
+
+XGBoost shows strong performance even with default parameters, demonstrating its ability to automatically learn complex patterns.
+
+## Model Comparison Summary
+
+Let's compare all models tested so far:
+
+```{r model-comparison}
+model_results <- data.frame(
+  Model = c("Baseline (Majority Class)", "Logistic Regression (Basic)", "XGBoost (Basic)"),
+  CV_AUC = c(0.5000, 
+             round(model_logistic_basic$results$ROC, 4),
+             round(max(xgb_cv$evaluation_log$test_auc_mean), 4))
+) |> 
+  arrange(desc(CV_AUC))
+
+kable(model_results, caption = "Model Comparison (Cross-Validation AUC)")
+```
+
+**Key Findings:**
+- Both models significantly outperform the baseline (AUC > 0.5)
+- XGBoost achieves higher AUC than logistic regression, justifying its use for this problem
+- The difference suggests non-linear patterns and interactions are important
+
+We'll proceed with XGBoost for further experiments with class imbalance handling and hyperparameter tuning.
+
+# Addressing Class Imbalance
+
+With our target variable at ~8% default rate, we need to test whether class imbalance techniques improve model performance. We'll experiment with two common strategies:
+
+1. **Downsampling**: Randomly removing majority class observations to balance the classes
+2. **SMOTE/ROSE**: Creating synthetic minority class samples
+
+**Important**: We apply these techniques to the training data only, never to the test data. Cross-validation is still performed on the resampled data to estimate performance.
+
+## Strategy 1: Downsampling
+
+Downsampling reduces the majority class to match the minority class size. This creates a balanced dataset but loses information from discarded observations.
+
+```{r downsample, results='hide'}
+set.seed(42)
+train_down <- downSample(
+  x = train_sample |> select(-TARGET),
+  y = factor(train_sample$TARGET, levels = c(0, 1)),
+  yname = "TARGET"
+)
+
+cat("Original class distribution:\n")
+print(table(train_sample$TARGET))
+cat("\nDownsampled class distribution:\n")
+print(table(train_down$TARGET))
+```
+
+Now we have a perfectly balanced dataset. Let's train XGBoost on it and compare performance.
+
+```{r model-xgb-downsample, results='hide'}
+
+# Train XGBoost on downsampled data
+train_down_matrix <- train_down |> select(-TARGET) |> as.matrix()
+train_down_label <- as.numeric(train_down$TARGET) - 1
+dtrain_down <- xgb.DMatrix(data = train_down_matrix, label = train_down_label)
+
+xgb_cv_down <- xgb.cv(
+  params = xgb_params,
+  data = dtrain_down,
+  nrounds = 100,
+  nfold = 3,
+  early_stopping_rounds = 10,
+  verbose = 0
+)
+
+cat("\nXGBoost (Downsampled) - CV AUC:", round(max(xgb_cv_down$evaluation_log$test_auc_mean), 4), "\n")
+```
+
+## Strategy 2: SMOTE
+
+SMOTE (Synthetic Minority Over-sampling Technique) creates synthetic examples of the minority class rather than simply duplicating them. The ROSE package provides a similar approach that we'll use here.
+
+```{r smote, results='hide'}
+set.seed(42)
+train_smote <- ROSE(
+  TARGET ~ .,
+  data = train_sample,
+  N = nrow(train_sample),
+  seed = 42
+)$data
+
+cat("SMOTE class distribution:\n")
+print(table(train_smote$TARGET))
+```
+
+SMOTE has created a more balanced dataset while maintaining the original sample size.
+
+```{r model-xgb-smote, results='hide'}
+train_smote_matrix <- train_smote |> select(-TARGET) |> as.matrix()
+train_smote_label <- train_smote$TARGET
+dtrain_smote <- xgb.DMatrix(data = train_smote_matrix, label = train_smote_label)
+
+xgb_cv_smote <- xgb.cv(
+  params = xgb_params,
+  data = dtrain_smote,
+  nrounds = 100,
+  nfold = 3,
+  early_stopping_rounds = 10,
+  verbose = 0
+)
+
+cat("\nXGBoost (SMOTE) - CV AUC:", round(max(xgb_cv_smote$evaluation_log$test_auc_mean), 4), "\n")
+```
+
+## Class Imbalance Comparison
+
+Now let's compare all three strategies side by side:
+
+```{r imbalance-comparison}
+imbalance_results <- data.frame(
+  Strategy = c("No Adjustment", "Downsampling", "SMOTE"),
+  CV_AUC = c(
+    round(max(xgb_cv$evaluation_log$test_auc_mean), 4),
+    round(max(xgb_cv_down$evaluation_log$test_auc_mean), 4),
+    round(max(xgb_cv_smote$evaluation_log$test_auc_mean), 4)
+  )
+) |> 
+  arrange(desc(CV_AUC))
+
+kable(imbalance_results, caption = "Class Imbalance Strategy Comparison")
+```
+
+**Conclusion:** Based on the results, we can see which strategy achieved the highest CV AUC. We'll use this approach for our final model. Note that very high AUC scores (close to 1.0) from SMOTE may indicate overfitting on synthetic data and should be interpreted cautiously.
+
+# Hyperparameter Tuning
+
+Now that we've identified our best modeling approach, we'll perform hyperparameter tuning to squeeze out additional performance. We use **randomized search** rather than exhaustive grid search to efficiently explore the hyperparameter space.
+
+**Tuning strategy:**
+- Test 20 random hyperparameter combinations
+- Use 3-fold CV on a 5,000-row sample for speed
+- Focus on key XGBoost parameters: learning rate (eta), tree depth, and regularization
+
+Once we find optimal parameters, we'll retrain on the full dataset.
+
+```{r hyperparameter-tuning, results='hide'}
+# Define parameter grid
+param_grid <- expand.grid(
+  eta = c(0.01, 0.05, 0.1, 0.3),
+  max_depth = c(3, 6, 9),
+  subsample = c(0.7, 0.8, 1),
+  colsample_bytree = c(0.6, 0.8, 1),
+  gamma = c(0, 0.1),
+  min_child_weight = c(1, 3, 5)
+)
+
+# Random sample 20 combinations
+set.seed(42)
+param_sample <- param_grid |> slice_sample(n = 20)
+
+# Determine which dataset to use (based on best imbalance strategy)
+best_strategy <- imbalance_results$Strategy[1]
+if (best_strategy == "Downsampling") {
+  tune_data <- dtrain_down
+} else if (best_strategy == "SMOTE") {
+  tune_data <- dtrain_smote
+} else {
+  tune_data <- dtrain
+}
+
+# Test each parameter combination
+results_list <- list()
+cat("Testing", nrow(param_sample), "parameter combinations...\n")
+
+for (i in 1:nrow(param_sample)) {
+  params_i <- list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    eta = param_sample$eta[i],
+    max_depth = param_sample$max_depth[i],
+    subsample = param_sample$subsample[i],
+    colsample_bytree = param_sample$colsample_bytree[i],
+    gamma = param_sample$gamma[i],
+    min_child_weight = param_sample$min_child_weight[i]
+  )
+  
+  cv_i <- xgb.cv(
+    params = params_i,
+    data = tune_data,
+    nrounds = 150,
+    nfold = 3,
+    early_stopping_rounds = 10,
+    verbose = 0
+  )
+  
+  # Get best iteration (use last iteration if early stopping didn't trigger)
+  best_iter_i <- if (!is.null(cv_i$best_iteration)) {
+    cv_i$best_iteration
+  } else {
+    nrow(cv_i$evaluation_log)
+  }
+  
+  best_auc_i <- cv_i$evaluation_log$test_auc_mean[best_iter_i]
+  
+  results_list[[i]] <- data.frame(
+    eta = param_sample$eta[i],
+    max_depth = param_sample$max_depth[i],
+    subsample = param_sample$subsample[i],
+    colsample_bytree = param_sample$colsample_bytree[i],
+    gamma = param_sample$gamma[i],
+    min_child_weight = param_sample$min_child_weight[i],
+    best_iter = best_iter_i,
+    best_auc = best_auc_i
+  )
+  
+  if (i %% 5 == 0) cat("  Completed", i, "/", nrow(param_sample), "\n")
+}
+
+# Combine results
+tuning_results <- bind_rows(results_list) |> arrange(desc(best_auc))
+best_params <- tuning_results[1, ]
+
+cat("\n=== Best Hyperparameters ===\n")
+print(best_params)
+```
+
+```{r hyperparameter-viz}
+# Show top 5 parameter combinations
+cat("\nTop 5 Parameter Combinations:\n")
+kable(tuning_results |> head(5) |> select(-gamma, -min_child_weight), digits = 4)
+```
+
+**Key insights from tuning:**
+- The best learning rate balances training speed and model accuracy
+- Tree depth controls model complexity - deeper trees capture more interactions
+- Regularization parameters (gamma, min_child_weight) help prevent overfitting
+
+# Final Model Training
+
+With optimal hyperparameters identified, we now train the final model on the **full training dataset** (not just the 5K sample). This gives the model access to all available information and should improve generalization.
+
+We also apply our best class imbalance strategy to the full dataset before training.
+
+```{r final-model-training, results='hide'}
+# Prepare full training data
+train_full_matrix <- train_final |> select(-TARGET) |> as.matrix()
+train_full_label <- train_final$TARGET
+
+# Apply best class imbalance strategy if needed
+if (best_strategy == "Downsampling") {
+  train_full_balanced <- downSample(
+    x = train_final |> select(-TARGET),
+    y = factor(train_final$TARGET),
+    yname = "TARGET"
+  )
+  train_full_matrix <- train_full_balanced |> select(-TARGET) |> as.matrix()
+  train_full_label <- as.numeric(train_full_balanced$TARGET) - 1
+} else if (best_strategy == "SMOTE") {
+  train_full_balanced <- ROSE(
+    TARGET ~ .,
+    data = train_final,
+    N = nrow(train_final),
+    seed = 42
+  )$data
+  train_full_matrix <- train_full_balanced |> select(-TARGET) |> as.matrix()
+  train_full_label <- train_full_balanced$TARGET
+}
+
+# Create DMatrix
+dfull <- xgb.DMatrix(data = train_full_matrix, label = train_full_label)
+
+# Train final model with best parameters
+final_params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = best_params$eta,
+  max_depth = best_params$max_depth,
+  subsample = best_params$subsample,
+  colsample_bytree = best_params$colsample_bytree,
+  gamma = best_params$gamma,
+  min_child_weight = best_params$min_child_weight
+)
+
+model_final <- xgb.train(
+  params = final_params,
+  data = dfull,
+  nrounds = best_params$best_iter,
+  verbose = 0
+)
+
+cat("Final model trained on", nrow(train_full_matrix), "observations\n")
+cat("Number of predictors:", ncol(train_full_matrix), "\n")
+cat("Best CV AUC:", round(best_params$best_auc, 4), "\n")
+```
+
+The final model is now trained and ready for predictions.
+
+```{r variable-importance}
+# Variable importance
+importance_matrix <- xgb.importance(
+  feature_names = colnames(train_full_matrix),
+  model = model_final
+)
+
+# Plot top 20 features
+xgb.ggplot.importance(importance_matrix, top_n = 20) +
+  labs(title = "Top 20 Variable Importance") +
+  theme_minimal()
+```
+
+**Feature importance insights:**
+
+The most predictive features align with our EDA findings. External credit scores (EXT_SOURCE variables) are typically the strongest predictors, followed by financial ratios and aggregated credit history features. This confirms that:
+
+1. Credit bureau data is highly informative for default prediction
+2. Financial ratios capture applicant affordability
+3. Past credit behavior (from supplementary tables) adds significant predictive power
+
+# Generate Kaggle Submission
+
+Finally, we prepare predictions for the test set and create a submission file. **Critical**: We must include all 48,744 test observations (Kaggle requirement), not just those with complete data. XGBoost can handle missing values, so we keep all rows.
+
+## Prepare Test Data
+
+```{r prepare-test-data, results='hide'}
+# Prepare test data in same format as training
+# Keep all rows - don't drop NAs, XGBoost can handle them
+test_final <- test_processed |> 
+  select(all_of(numeric_cols)) |> 
+  # Replace Inf values with NA (XGBoost can handle NA but not Inf)
+  mutate(across(everything(), ~ifelse(is.infinite(.), NA, .)))
+
+# Keep track of SK_ID_CURR for submission
+test_ids <- test_processed |> 
+  pull(SK_ID_CURR)
+
+# Convert to matrix (NAs will be handled by XGBoost)
+test_matrix <- test_final |> as.matrix()
+dtest <- xgb.DMatrix(data = test_matrix, missing = NA)
+
+cat("Test set prepared:", nrow(test_matrix), "observations\n")
+cat("All", nrow(test_processed), "test observations included (no rows dropped)\n")
+cat("Submission will have", nrow(test_matrix), "rows (required: 48,744)\n")
+```
+
+Perfect - we have all 48,744 rows required by Kaggle.
+
+## Generate Predictions
+
+```{r generate-predictions, results='hide'}
+# Generate predictions
+test_predictions <- predict(model_final, dtest)
+
+# Create submission file
+submission <- data.frame(
+  SK_ID_CURR = test_ids,
+  TARGET = test_predictions
+)
+
+# Write submission file
+write_csv(submission, "submission.csv")
+cat("Submission file created with", nrow(submission), "predictions\n")
+
+# Show sample predictions
+head(submission) |> kable(caption = "Sample Predictions")
+```
+
+The submission file `submission.csv` is ready to upload to Kaggle. Each prediction represents the estimated probability of default for that applicant.
+
+# Kaggle Score
+
+**After submitting to Kaggle:**
+
+- **Public Leaderboard Score: .50582** 
+- **Private Leaderboard Score: .51057**
+
+# Summary and Conclusions
+
+## Models Explored
+
+```{r summary-models}
+summary_models <- data.frame(
+  Model = c("Baseline (Majority Class)", "Logistic Regression (Basic)", 
+            "XGBoost (Basic)", "XGBoost (Tuned)"),
+  CV_AUC = c(0.5000,
+             round(model_logistic_basic$results$ROC, 4),
+             round(max(xgb_cv$evaluation_log$test_auc_mean), 4),
+             round(best_params$best_auc, 4))
+)
+kable(summary_models, caption = "Model Performance Summary")
+```
+
+## Class Imbalance Strategies
+
+```{r summary-imbalance}
+cat("We tested three approaches:\n")
+cat("- No adjustment\n")
+cat("- Downsampling\n")
+cat("- SMOTE (synthetic oversampling)\n\n")
+
+cat("Best strategy:", best_strategy, "\n")
+cat("Best CV AUC:", round(imbalance_results$CV_AUC[1], 4), "\n")
+```
+
+## Final Model Selection
+
+**Model:** XGBoost with hyperparameter tuning
+
+```{r summary-performance}
+cat("Performance:\n")
+cat("- Cross-validation AUC:", round(best_params$best_auc, 4), "\n")
+cat("- Training observations:", nrow(train_full_matrix), "\n")
+cat("- Number of features:", ncol(train_full_matrix), "\n\n")
+
+cat("Best Hyperparameters:\n")
+cat("- Learning rate (eta):", best_params$eta, "\n")
+cat("- Max depth:", best_params$max_depth, "\n")
+cat("- Subsample:", best_params$subsample, "\n")
+cat("- Column sample:", best_params$colsample_bytree, "\n")
+```
+
+## Key Predictive Features
+
+Top 5 most important features:
+```{r top-features}
+kable(importance_matrix |> head(5) |> select(Feature, Gain), 
+      caption = "Top 5 Features by Importance")
+```
+
+The EXT_SOURCE variables (external credit scores) are expected to be among the most important predictors, along with financial ratios and aggregated features from supplementary data.
+
+## Next Steps
+
+Potential improvements for future iterations:
+
+- Incorporate additional supplementary tables (POS_CASH_balance, credit_card_balance)
+- Engineer more sophisticated interaction features
+- Experiment with ensemble methods (stacking multiple models)
+- Perform more extensive hyperparameter tuning with larger grids
+- Try other algorithms (LightGBM, CatBoost)
+
+---
+
+**Session Info**
+
+```{r session-info}
+sessionInfo()
+```
