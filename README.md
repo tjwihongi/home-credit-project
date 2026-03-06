@@ -192,3 +192,50 @@ home-credit-project/
 - Do **not** commit data files, model objects, or large intermediate files. These are listed in `.gitignore`.
 - The pipeline is modular and can be extended with additional features as needed.
 - All code is designed for reproducibility with proper random seeds set.
+
+---
+
+# Model Card
+
+## Overview
+
+The model card (`model_card.Rmd`) documents the XGBoost model following industry best practices for responsible AI. Model cards are increasingly required by regulations (EU AI Act 2025) and demonstrate professional ML documentation standards.
+
+## Critical Finding: ⚠️ DO NOT DEPLOY
+
+**Issue:** Severe overfitting - CV AUC 1.000 vs Test AUC 0.506 (49.4pp gap)
+
+- **Cause:** SMOTE synthetic oversampling created artificial data  
+- **Impact:** Zero predictive power on real applicants
+- **Risk:** $2-5M annual losses, regulatory violations
+
+## Key Analyses
+
+### Decision Threshold (0.08)
+Based on industry costs: $2K profit/repaid, $5K loss/default (World Bank, Basel sources)
+
+### Explainability (SHAP)
+Top features: External credit scores (78%), Age (13%), Credit-to-income ratio (10%)
+
+### Fairness
+- Gender: ✅ Pass (85% vs 85%, ratio=1.00)
+- Education: ⚠️ Monitor (79-91%, justified by default risk)
+
+### Adverse Action
+Features translated to consumer language for legal compliance (ECOA)
+
+## Rebuild Roadmap
+
+**Timeline:** 3-4 months | **Investment:** ~$200K
+
+1. Remove SMOTE, use class weights
+2. Proper validation framework  
+3. Enhanced feature engineering
+4. Regulatory review
+5. Pilot deployment
+
+**Target:** Validation AUC ≥ 0.65
+
+## How to View
+
+Knit `model_card.Rmd` to HTML for stakeholder presentation (code hidden by default)
